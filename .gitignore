@@ -1,0 +1,28 @@
+# 機密資訊 - 絕對不能上傳到GitHub
+.env
+*.env
+
+# Python環境和緩存
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.venv/
+
+# 臨時文件
+*.tmp
+*.log
+
+# YouTube cookies (如果使用)
+cookies.txt
+
+# IDE設定
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 作業系統文件
+.DS_Store
+Thumbs.db
