@@ -6,6 +6,7 @@ import yt_dlp
 import asyncio
 from collections import deque
 import re
+from urllib.parse import quote
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from lyrics import fetch_synced_lyrics, current_line_index
@@ -29,8 +30,9 @@ lyrics_tasks = {}
 # 「正在播放」訊息上的控制按鈕 - 每個伺服器同時只會有一組
 player_controls = {}
 
-# 歌詞比實際播放提早多少秒顯示，抵銷編輯訊息的網路延遲
-LYRICS_LEAD = 0.3
+# 歌詞比 LRC 時間提早多少秒顯示：LRC 是人工跟著聽打的，實測比真正開始唱晚約 0.3 秒，
+# 再加上編輯訊息到大家畫面上的延遲 (約 0.3 秒) 比語音延遲大，提早 0.8 秒剛好在開口前出現
+LYRICS_LEAD = 0.8
 # 兩次編輯歌詞訊息之間至少間隔幾秒，避免撞到 Discord 的頻率限制
 LYRICS_MIN_EDIT_INTERVAL = 1.0
 
@@ -55,7 +57,8 @@ ffmpeg_options = {
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 # 加入佇列時只需要標題和上傳者，搜尋結果不解析音訊格式會快很多
-ytdl_lookup = yt_dlp.YoutubeDL({**ytdl_format_options, 'extract_flat': 'in_playlist'})
+# (只取第一筆，不然 YouTube Music 搜尋會把所有結果頁都翻完，要十幾秒)
+ytdl_lookup = yt_dlp.YoutubeDL({**ytdl_format_options, 'extract_flat': 'in_playlist', 'playlistend': 1})
 
 
 class TimedAudio(discord.FFmpegPCMAudio):
@@ -248,16 +251,24 @@ async def play_next(ctx):
     track = music_queues[guild_id].popleft()
 
     try:
+        # Spotify 播放清單的歌加入時沒有先查，輪到它才找要播哪個影片
+        if 'url' not in track:
+            resolved = await resolve_track(track['search'])
+            if not resolved:
+                raise RuntimeError(f"找不到 {track['title']}")
+            track.update(resolved)
+        prefetch_lyrics(track)
+
         # 從YouTube取得音訊串流
         data = await asyncio.get_event_loop().run_in_executor(
             None, lambda: ytdl.extract_info(track['url'], download=False)
         )
-        
+
         if 'entries' in data:
             data = data['entries'][0]
-        
+
         audio_url = data['url']
-        title = data.get('title', '未知標題')
+        title = track['title']
 
         # 播放音訊 (after 是在播放執行緒裡呼叫的，要交回機器人的事件迴圈執行)
         source = TimedAudio(audio_url, **ffmpeg_options)
@@ -270,9 +281,8 @@ async def play_next(ctx):
         controls.message = await ctx.send(f"🎵 正在播放: **{title}**", view=controls)
         player_controls[guild_id] = controls
 
-        # 用使用者的搜尋字 (或 Spotify 的歌名+歌手) 幫忙找歌詞
         lyrics_tasks[guild_id] = asyncio.create_task(
-            show_lyrics(ctx, source, title, data.get('duration'), track['hint'])
+            show_lyrics(ctx, source, title, track['lyrics'])
         )
 
     except Exception as e:
@@ -313,9 +323,9 @@ def render_lyrics(title, lines, index):
     return "\n".join(parts)
 
 # 抓歌詞並跟著播放進度更新訊息
-async def show_lyrics(ctx, source, title, duration, hint):
+async def show_lyrics(ctx, source, title, lyrics_task):
     try:
-        lines = await fetch_synced_lyrics(title, duration, hint)
+        lines = await lyrics_task
     except Exception as e:
         print(f'歌詞抓取錯誤: {e}')
         lines = None
@@ -344,21 +354,60 @@ async def show_lyrics(ctx, source, title, duration, hint):
         await asyncio.sleep(LYRICS_MIN_EDIT_INTERVAL)
 
 # 先查出影片的標題和上傳者，加入佇列時才能顯示
-async def resolve_track(query, hint=None):
-    data = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: ytdl_lookup.extract_info(query, download=False)
-    )
+# 關鍵字搜尋優先找 YouTube Music 的「歌曲」(專輯音軌)
+# MV 常有劇情前奏，但 LRCLIB 的歌詞時間軸幾乎都是對專輯版，播 MV 的話歌詞會早好幾秒到十幾秒
+YTM_SONG_SEARCH = 'https://music.youtube.com/search?q={}#songs'
+
+def _first_result(query):
+    data = ytdl_lookup.extract_info(query, download=False)
     if 'entries' in data:
-        if not data['entries']:
-            return None
-        data = data['entries'][0]
+        entries = list(data['entries'] or [])
+        return entries[0] if entries else None
+    return data
+
+async def resolve_track(search):
+    loop = asyncio.get_event_loop()
+    is_url = search.startswith('http://') or search.startswith('https://')
+
+    data = None
+    if not is_url:
+        try:
+            song = await loop.run_in_executor(None, lambda: _first_result(YTM_SONG_SEARCH.format(quote(search))))
+            if song and song.get('url'):
+                # 搜尋結果沒有歌手和長度，要再解析一次歌曲本身
+                data = await loop.run_in_executor(None, lambda: _first_result(song['url']))
+        except Exception as e:
+            print(f'YouTube Music 搜尋失敗，改用一般搜尋: {e}')
+    if data is None:
+        data = await loop.run_in_executor(None, lambda: _first_result(search if is_url else f"ytsearch:{search}"))
+    if not data:
+        return None
+
+    title = ' '.join((data.get('title') or '未知標題').split())
+    artists = list(dict.fromkeys(data.get('artists') or ([data['artist']] if data.get('artist') else [])))
+    # 找歌詞用的搜尋字：正式的歌名+歌手最準，但常是英文 (例：Kenshi Yonezu)，
+    # 所以也帶上使用者打的字 (例：米津玄師)，才找得到原文歌詞而不是羅馬拼音
+    hints = []
+    if data.get('track') and artists:
+        title = f"{data['track']} - {', '.join(artists)}"
+        hints.append(f"{data['track']} {artists[0]}")
+    if not is_url:
+        hints.append(search)
 
     return {
-        'url': data.get('webpage_url') or data.get('url') or query,
-        'title': ' '.join((data.get('title') or '未知標題').split()),
+        'url': data.get('webpage_url') or data.get('url') or search,
+        'title': title,
         'uploader': data.get('uploader') or data.get('channel') or '未知',
-        'hint': hint,
+        'duration': data.get('duration'),
+        'hints': hints,
     }
+
+# 加入佇列時就先開始抓歌詞，輪到這首時通常已經抓好，開頭幾句不會漏掉
+def prefetch_lyrics(track):
+    if 'lyrics' not in track:
+        track['lyrics'] = asyncio.create_task(
+            fetch_synced_lyrics(track['title'], track.get('duration'), track['hints'])
+        )
 
 # 「已加入佇列」的卡片
 def queued_embed(track, position):
@@ -385,7 +434,7 @@ async def play(ctx, *, search):
     if guild_id not in music_queues:
         music_queues[guild_id] = deque()
 
-    # 要加入佇列的單首歌：(搜尋字串或網址, 找歌詞用的提示)
+    # 要加入佇列的單首歌 (搜尋關鍵字或網址)
     single = None
 
     # 檢查是否為 Spotify URL
@@ -400,17 +449,16 @@ async def play(ctx, *, search):
         # 處理單首歌曲
         if isinstance(spotify_info, tuple) and len(spotify_info) == 3:
             search_query, title, artist = spotify_info
-            single = (f"ytsearch:{search_query}", search_query)
+            single = search_query
 
         # 處理播放清單或專輯 (歌太多，不一首首查標題，播放時才搜尋)
         elif isinstance(spotify_info, list):
             added_count = 0
             for search_query, title, artist in spotify_info[:50]:  # 限制最多50首
                 music_queues[guild_id].append({
-                    'url': f"ytsearch:{search_query}",
+                    'search': search_query,
                     'title': f"{title} - {artist}",
                     'uploader': artist,
-                    'hint': search_query,
                 })
                 added_count += 1
 
@@ -418,15 +466,11 @@ async def play(ctx, *, search):
 
     # 處理YouTube URL或一般搜尋
     else:
-        # 如果不是URL，當作搜尋關鍵字
-        if search.startswith('http://') or search.startswith('https://'):
-            single = (search, None)
-        else:
-            single = (f"ytsearch:{search}", search)
+        single = search
 
     if single:
         try:
-            track = await resolve_track(*single)
+            track = await resolve_track(single)
         except Exception as e:
             await ctx.send(f"❌ 找不到這首歌: {str(e)}")
             return
@@ -434,6 +478,7 @@ async def play(ctx, *, search):
             await ctx.send("❌ 找不到這首歌")
             return
 
+        prefetch_lyrics(track)
         music_queues[guild_id].append(track)
 
         # 前面還有歌在播，才需要告訴使用者排在第幾首

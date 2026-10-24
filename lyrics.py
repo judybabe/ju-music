@@ -14,6 +14,11 @@ DURATION_TOLERANCE = 10
 MAX_QUERIES = 6
 
 _TIMESTAMP = re.compile(r'\[(\d+):(\d+(?:\.\d+)?)\]')
+# 有些歌詞開頭會放製作名單 (例：编曲 : 告五人)，不是歌詞，不要顯示
+_CREDIT = re.compile(
+    r'^(作词|作詞|作曲|编曲|編曲|制作人|製作人|监制|監製|混音|母带|母帶|和声|和聲|录音|錄音|'
+    r'出品|发行|發行|词|詞|曲)\s*[:：]'
+)
 _OFFSET = re.compile(r'^\[offset:\s*([+-]?\d+)\]', re.IGNORECASE)
 
 # YouTube 標題裡和歌名無關的字
@@ -47,6 +52,8 @@ def parse_lrc(text):
         if not stamps:
             continue
         lyric = _TIMESTAMP.sub('', raw).strip()
+        if _CREDIT.match(lyric):
+            continue
         for minutes, seconds in stamps:
             lines.append((int(minutes) * 60 + float(seconds) - offset, lyric))
 
@@ -75,8 +82,8 @@ def _script_runs(text):
     return _unique(run.strip() for run in _SCRIPT_RUNS.findall(text))
 
 
-def build_queries(title, hint=None):
-    """從 YouTube 標題 (和使用者的搜尋字) 組出由精確到寬鬆的 LRCLIB 搜尋字串"""
+def build_queries(title, hints=()):
+    """從 YouTube 標題 (和歌名歌手、使用者的搜尋字) 組出由精確到寬鬆的 LRCLIB 搜尋字串"""
     # 括號裡只有雜訊 (例：【歌詞動画/Lyric Video】) 就整個拿掉，不當成歌名
     title = _BRACKETS.sub(lambda m: m.group(0) if _clean(m.group(1)) else ' ', title)
 
@@ -97,7 +104,7 @@ def build_queries(title, hint=None):
     track_options = _unique(_script_runs(track)[:1] + [track])
     artist_options = _unique(_script_runs(artist) + [artist]) if artist else []
 
-    queries = [hint] if hint else []
+    queries = list(hints)
     for track_option in track_options:
         for artist_option in artist_options:
             queries.append(f'{track_option} {artist_option}')
@@ -106,20 +113,32 @@ def build_queries(title, hint=None):
     return _unique(queries)[:MAX_QUERIES]
 
 
-def _pick_synced(results, duration):
-    """挑出有同步歌詞、而且長度最接近影片的版本"""
-    candidates = [
+def _candidates(results, duration):
+    """有同步歌詞、而且長度和影片差不多的版本"""
+    return [
         item for item in results
         if isinstance(item, dict) and item.get('syncedLyrics') and not item.get('instrumental')
+        and (not duration or abs((item.get('duration') or 0) - duration) <= DURATION_TOLERANCE)
     ]
-    if not duration:
-        return candidates[0] if candidates else None
 
-    candidates = [
-        item for item in candidates
-        if abs((item.get('duration') or 0) - duration) <= DURATION_TOLERANCE
-    ]
-    return min(candidates, key=lambda item: abs(item['duration'] - duration), default=None)
+
+def _non_latin_ratio(text):
+    letters = [ch for ch in text if ch.isalpha()]
+    return sum(ord(ch) > 0x24f for ch in letters) / len(letters) if letters else 0.0
+
+
+def _score(item, duration, wants_non_latin):
+    """越大越好：中日韓等歌曲先比原文比例 (不要羅馬拼音)，再比長度"""
+    script = round(_non_latin_ratio(item['syncedLyrics']), 1) if wants_non_latin else 0
+    length_diff = abs((item.get('duration') or 0) - duration) if duration else 0
+    return script, -length_diff
+
+
+def _same_track(a, b):
+    def key(item):
+        return ''.join(ch for ch in (item.get('trackName') or '').lower() if ch.isalnum())
+    ka, kb = key(a), key(b)
+    return bool(ka and kb) and (ka in kb or kb in ka)
 
 
 async def _search(session, query, retries=2):
@@ -136,20 +155,41 @@ async def _search(session, query, retries=2):
     return []
 
 
-async def fetch_synced_lyrics(title, duration=None, hint=None):
+async def find_synced_match(session, title, duration=None, hints=()):
+    """回傳最適合的 LRCLIB 歌詞資料，找不到回傳 None"""
+    # 歌名、歌手或搜尋字裡有中日韓等文字，就要原文歌詞
+    wants_non_latin = any(_non_latin_ratio(text) > 0 for text in (title, *hints))
+
+    best = None
+    for query in build_queries(title, hints):
+        try:
+            results = await _search(session, query)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f'歌詞搜尋失敗 ({query}): {e}')
+            continue
+
+        candidates = _candidates(results, duration)
+        if not candidates:
+            continue
+        pick = max(candidates, key=lambda item: _score(item, duration, wants_non_latin))
+        if best is None:
+            best = pick
+        elif (_same_track(pick, best) and
+              _non_latin_ratio(pick['syncedLyrics']) >= _non_latin_ratio(best['syncedLyrics']) + 0.1):
+            # 同一首歌找到更接近原文的版本 (例：日文歌詞取代羅馬拼音)
+            best = pick
+
+        # 拉丁字母的歌，或已經是原文歌詞 (韓文歌常夾英文，所以不要求 100%)，就不用再查了
+        if not wants_non_latin or _non_latin_ratio(best['syncedLyrics']) >= 0.6:
+            break
+    return best
+
+
+async def fetch_synced_lyrics(title, duration=None, hints=()):
     """搜尋同步歌詞，找到就回傳 parse_lrc 的結果，找不到回傳 None"""
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(headers={'User-Agent': USER_AGENT}, timeout=timeout) as session:
-        for query in build_queries(title, hint):
-            try:
-                results = await _search(session, query)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                print(f'歌詞搜尋失敗 ({query}): {e}')
-                continue
-
-            match = _pick_synced(results, duration)
-            if match:
-                lines = parse_lrc(match['syncedLyrics'])
-                if lines:
-                    return lines
-    return None
+        match = await find_synced_match(session, title, duration, hints)
+    if not match:
+        return None
+    return parse_lrc(match['syncedLyrics']) or None
