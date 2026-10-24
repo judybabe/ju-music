@@ -6,8 +6,10 @@ import yt_dlp
 import asyncio
 from collections import deque
 import re
+from urllib.parse import quote
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
+from lyrics import fetch_synced_lyrics, current_line_index
 
 # 載入環境變數
 load_dotenv()
@@ -21,6 +23,18 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # 音樂佇列 - 每個伺服器都有自己的佇列
 music_queues = {}
+
+# 歌詞同步任務 - 每個伺服器同時只會有一個
+lyrics_tasks = {}
+
+# 「正在播放」訊息上的控制按鈕 - 每個伺服器同時只會有一組
+player_controls = {}
+
+# 歌詞比 LRC 時間提早多少秒顯示：LRC 是人工跟著聽打的，實測比真正開始唱晚約 0.3 秒，
+# 再加上編輯訊息到大家畫面上的延遲 (約 0.3 秒) 比語音延遲大，提早 0.8 秒剛好在開口前出現
+LYRICS_LEAD = 0.8
+# 兩次編輯歌詞訊息之間至少間隔幾秒，避免撞到 Discord 的頻率限制
+LYRICS_MIN_EDIT_INTERVAL = 1.0
 
 # yt-dlp 設定
 ytdl_format_options = {
@@ -42,6 +56,88 @@ ffmpeg_options = {
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+# 加入佇列時只需要標題和上傳者，搜尋結果不解析音訊格式會快很多
+# (只取第一筆，不然 YouTube Music 搜尋會把所有結果頁都翻完，要十幾秒)
+ytdl_lookup = yt_dlp.YoutubeDL({**ytdl_format_options, 'extract_flat': 'in_playlist', 'playlistend': 1})
+
+
+class TimedAudio(discord.FFmpegPCMAudio):
+    """記錄已送出的音訊幀數，算出實際播放到第幾秒 (不受 ffmpeg 啟動延遲影響)"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.frames = 0
+
+    def read(self):
+        data = super().read()
+        if data:
+            self.frames += 1
+        return data
+
+    @property
+    def position(self):
+        return self.frames * discord.opus.Encoder.FRAME_LENGTH / 1000
+
+
+class PlayerControls(discord.ui.View):
+    """「正在播放」訊息下方的播放、暫停、下一首按鈕"""
+
+    def __init__(self, voice_client):
+        # 歌多長按鈕就要能按多久，所以不設逾時
+        super().__init__(timeout=None)
+        self.voice_client = voice_client
+        self.message = None
+        self.sync_buttons()
+
+    def sync_buttons(self):
+        paused = self.voice_client.is_paused()
+        self.resume_button.disabled = not paused
+        self.pause_button.disabled = paused
+
+    async def interaction_check(self, interaction):
+        voice = interaction.user.voice
+        if voice and voice.channel == self.voice_client.channel:
+            return True
+        await interaction.response.send_message("❌ 你要在同一個語音頻道才能控制播放", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="播放", emoji="▶️", style=discord.ButtonStyle.success)
+    async def resume_button(self, interaction, button):
+        if self.voice_client.is_paused():
+            self.voice_client.resume()
+        self.sync_buttons()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="暫停", emoji="⏸️", style=discord.ButtonStyle.secondary)
+    async def pause_button(self, interaction, button):
+        if self.voice_client.is_playing():
+            self.voice_client.pause()
+        self.sync_buttons()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="下一首", emoji="⏭️", style=discord.ButtonStyle.primary)
+    async def skip_button(self, interaction, button):
+        self.disable_all()
+        await interaction.response.edit_message(view=self)
+        # 停掉目前這首會觸發 after_playing，自動接著播佇列的下一首
+        if self.voice_client.is_playing() or self.voice_client.is_paused():
+            self.voice_client.stop()
+
+    def disable_all(self):
+        for item in self.children:
+            item.disabled = True
+        self.stop()
+
+    async def finish(self):
+        """歌曲結束後把按鈕停用，避免按到舊訊息上的按鈕"""
+        if self.is_finished():
+            return
+        self.disable_all()
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 # Spotify API 設定
 spotify_client_id = os.getenv('SPOTIFY_CLIENT_ID')
@@ -152,26 +248,43 @@ async def play_next(ctx):
     if guild_id not in music_queues or not music_queues[guild_id]:
         return
     
-    url = music_queues[guild_id].popleft()
-    
+    track = music_queues[guild_id].popleft()
+
     try:
+        # Spotify 播放清單的歌加入時沒有先查，輪到它才找要播哪個影片
+        if 'url' not in track:
+            resolved = await resolve_track(track['search'])
+            if not resolved:
+                raise RuntimeError(f"找不到 {track['title']}")
+            track.update(resolved)
+        prefetch_lyrics(track)
+
         # 從YouTube取得音訊串流
         data = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: ytdl.extract_info(url, download=False)
+            None, lambda: ytdl.extract_info(track['url'], download=False)
         )
-        
+
         if 'entries' in data:
             data = data['entries'][0]
-        
+
         audio_url = data['url']
-        title = data.get('title', '未知標題')
-        
-        # 播放音訊
-        source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
-        ctx.voice_client.play(source, after=lambda e: asyncio.create_task(after_playing(ctx, e)))
-        
-        await ctx.send(f"🎵 正在播放: **{title}**")
-        
+        title = track['title']
+
+        # 播放音訊 (after 是在播放執行緒裡呼叫的，要交回機器人的事件迴圈執行)
+        source = TimedAudio(audio_url, **ffmpeg_options)
+        ctx.voice_client.play(
+            source,
+            after=lambda e: asyncio.run_coroutine_threadsafe(after_playing(ctx, e), bot.loop)
+        )
+
+        controls = PlayerControls(ctx.voice_client)
+        controls.message = await ctx.send(f"🎵 正在播放: **{title}**", view=controls)
+        player_controls[guild_id] = controls
+
+        lyrics_tasks[guild_id] = asyncio.create_task(
+            show_lyrics(ctx, source, title, track['lyrics'])
+        )
+
     except Exception as e:
         await ctx.send(f"❌ 播放時發生錯誤: {str(e)}")
         # 如果這首歌出錯，繼續播放下一首
@@ -181,9 +294,130 @@ async def play_next(ctx):
 async def after_playing(ctx, error):
     if error:
         print(f'播放錯誤: {error}')
-    
+
+    stop_lyrics(ctx.guild.id)
+    controls = player_controls.pop(ctx.guild.id, None)
+    if controls:
+        await controls.finish()
+
     # 播放佇列中的下一首歌
     await play_next(ctx)
+
+# 停止目前的歌詞同步
+def stop_lyrics(guild_id):
+    task = lyrics_tasks.pop(guild_id, None)
+    if task:
+        task.cancel()
+
+# 組出歌詞訊息：上一句變淡、正在唱的那句放大、下面預告兩句
+def render_lyrics(title, lines, index):
+    def text(i):
+        return discord.utils.escape_markdown(lines[i][1]) or '♪'
+
+    parts = [f"🎤 **{discord.utils.escape_markdown(title)}**"]
+    if index >= 1:
+        parts.append(f"-# {text(index - 1)}")
+    parts.append(f"# {text(index) if index >= 0 else '♪'}")
+    for i in range(index + 1, min(index + 3, len(lines))):
+        parts.append(text(i))
+    return "\n".join(parts)
+
+# 抓歌詞並跟著播放進度更新訊息
+async def show_lyrics(ctx, source, title, lyrics_task):
+    try:
+        lines = await lyrics_task
+    except Exception as e:
+        print(f'歌詞抓取錯誤: {e}')
+        lines = None
+
+    if not lines:
+        await ctx.send("-# 🎤 找不到這首歌的同步歌詞")
+        return
+
+    shown = current_line_index(lines, source.position + LYRICS_LEAD)
+    message = await ctx.send(render_lyrics(title, lines, shown))
+
+    while ctx.voice_client and ctx.voice_client.source is source:
+        index = current_line_index(lines, source.position + LYRICS_LEAD)
+        if index == shown:
+            await asyncio.sleep(0.2)
+            continue
+
+        try:
+            await message.edit(content=render_lyrics(title, lines, index))
+        except discord.NotFound:
+            # 歌詞訊息被刪掉了，就不再更新
+            return
+        except discord.HTTPException as e:
+            print(f'更新歌詞失敗: {e}')
+        shown = index
+        await asyncio.sleep(LYRICS_MIN_EDIT_INTERVAL)
+
+# 先查出影片的標題和上傳者，加入佇列時才能顯示
+# 關鍵字搜尋優先找 YouTube Music 的「歌曲」(專輯音軌)
+# MV 常有劇情前奏，但 LRCLIB 的歌詞時間軸幾乎都是對專輯版，播 MV 的話歌詞會早好幾秒到十幾秒
+YTM_SONG_SEARCH = 'https://music.youtube.com/search?q={}#songs'
+
+def _first_result(query):
+    data = ytdl_lookup.extract_info(query, download=False)
+    if 'entries' in data:
+        entries = list(data['entries'] or [])
+        return entries[0] if entries else None
+    return data
+
+async def resolve_track(search):
+    loop = asyncio.get_event_loop()
+    is_url = search.startswith('http://') or search.startswith('https://')
+
+    data = None
+    if not is_url:
+        try:
+            song = await loop.run_in_executor(None, lambda: _first_result(YTM_SONG_SEARCH.format(quote(search))))
+            if song and song.get('url'):
+                # 搜尋結果沒有歌手和長度，要再解析一次歌曲本身
+                data = await loop.run_in_executor(None, lambda: _first_result(song['url']))
+        except Exception as e:
+            print(f'YouTube Music 搜尋失敗，改用一般搜尋: {e}')
+    if data is None:
+        data = await loop.run_in_executor(None, lambda: _first_result(search if is_url else f"ytsearch:{search}"))
+    if not data:
+        return None
+
+    title = ' '.join((data.get('title') or '未知標題').split())
+    artists = list(dict.fromkeys(data.get('artists') or ([data['artist']] if data.get('artist') else [])))
+    # 找歌詞用的搜尋字：正式的歌名+歌手最準，但常是英文 (例：Kenshi Yonezu)，
+    # 所以也帶上使用者打的字 (例：米津玄師)，才找得到原文歌詞而不是羅馬拼音
+    hints = []
+    if data.get('track') and artists:
+        title = f"{data['track']} - {', '.join(artists)}"
+        hints.append(f"{data['track']} {artists[0]}")
+    if not is_url:
+        hints.append(search)
+
+    return {
+        'url': data.get('webpage_url') or data.get('url') or search,
+        'title': title,
+        'uploader': data.get('uploader') or data.get('channel') or '未知',
+        'duration': data.get('duration'),
+        'hints': hints,
+    }
+
+# 加入佇列時就先開始抓歌詞，輪到這首時通常已經抓好，開頭幾句不會漏掉
+def prefetch_lyrics(track):
+    if 'lyrics' not in track:
+        track['lyrics'] = asyncio.create_task(
+            fetch_synced_lyrics(track['title'], track.get('duration'), track['hints'])
+        )
+
+# 「已加入佇列」的卡片
+def queued_embed(track, position):
+    embed = discord.Embed(
+        title="➕ 已加入佇列",
+        description=f"**{discord.utils.escape_markdown(track['title'])}**"
+    )
+    embed.add_field(name="👤 Uploader", value=discord.utils.escape_markdown(track['uploader']), inline=True)
+    embed.add_field(name="#️⃣ 位置", value=str(position), inline=True)
+    return embed
 
 # 播放指令
 @bot.command()
@@ -199,55 +433,66 @@ async def play(ctx, *, search):
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
         music_queues[guild_id] = deque()
-    
+
+    # 要加入佇列的單首歌 (搜尋關鍵字或網址)
+    single = None
+
     # 檢查是否為 Spotify URL
     if 'spotify.com' in search:
         await ctx.send("🎵 正在處理 Spotify 連結...")
         spotify_info = await get_spotify_track_info(search)
-        
+
         if not spotify_info:
             await ctx.send("❌ 無法處理此 Spotify 連結，請檢查 Spotify API 設定")
             return
-        
+
         # 處理單首歌曲
         if isinstance(spotify_info, tuple) and len(spotify_info) == 3:
             search_query, title, artist = spotify_info
-            youtube_search = f"ytsearch:{search_query}"
-            music_queues[guild_id].append(youtube_search)
-            await ctx.send(f"✅ 已從 Spotify 加入: **{title}** - {artist}")
-            
-        # 處理播放清單或專輯
+            single = search_query
+
+        # 處理播放清單或專輯 (歌太多，不一首首查標題，播放時才搜尋)
         elif isinstance(spotify_info, list):
             added_count = 0
             for search_query, title, artist in spotify_info[:50]:  # 限制最多50首
-                youtube_search = f"ytsearch:{search_query}"
-                music_queues[guild_id].append(youtube_search)
+                music_queues[guild_id].append({
+                    'search': search_query,
+                    'title': f"{title} - {artist}",
+                    'uploader': artist,
+                })
                 added_count += 1
-            
+
             await ctx.send(f"✅ 已從 Spotify 加入 {added_count} 首歌曲到佇列")
-    
+
     # 處理YouTube URL或一般搜尋
     else:
-        # 如果不是URL，當作搜尋關鍵字
-        if not (search.startswith('http://') or search.startswith('https://')):
-            search = f"ytsearch:{search}"
-        
-        music_queues[guild_id].append(search)
-        
-        # 嘗試取得歌曲標題預覽
-        if search.startswith('ytsearch:'):
-            await ctx.send(f"✅ 已加入佇列: {search[9:]}")  # 移除 'ytsearch:' 前綴
-        else:
-            await ctx.send(f"✅ 已加入佇列")
-    
-    # 如果目前沒有播放音樂，開始播放
-    if not ctx.voice_client.is_playing():
+        single = search
+
+    if single:
+        try:
+            track = await resolve_track(single)
+        except Exception as e:
+            await ctx.send(f"❌ 找不到這首歌: {str(e)}")
+            return
+        if not track:
+            await ctx.send("❌ 找不到這首歌")
+            return
+
+        prefetch_lyrics(track)
+        music_queues[guild_id].append(track)
+
+        # 前面還有歌在播，才需要告訴使用者排在第幾首
+        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            await ctx.send(embed=queued_embed(track, len(music_queues[guild_id])))
+
+    # 如果目前沒有播放音樂 (暫停中也算有歌)，開始播放
+    if not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         await play_next(ctx)
 
 # 跳過當前歌曲
 @bot.command()
 async def skip(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
+    if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         ctx.voice_client.stop()
         await ctx.send("⏭️ 已跳過當前歌曲")
     else:
@@ -274,7 +519,10 @@ async def queue(ctx):
         return
     
     queue_list = list(music_queues[guild_id])
-    queue_text = "\n".join([f"{i+1}. {song}" for i, song in enumerate(queue_list[:10])])
+    queue_text = "\n".join([
+        f"{i+1}. {discord.utils.escape_markdown(track['title'])}"
+        for i, track in enumerate(queue_list[:10])
+    ])
     
     embed = discord.Embed(title="🎵 播放佇列", description=queue_text, color=0x00ff00)
     if len(queue_list) > 10:
@@ -307,7 +555,8 @@ async def help_music(ctx):
             "`!play <歌名/URL>` - 播放歌曲或加入佇列\n"
             "`!skip` - 跳過當前歌曲\n"
             "`!stop` - 停止播放並清空佇列\n"
-            "`!queue` - 顯示播放佇列"
+            "`!queue` - 顯示播放佇列\n"
+            "也可以按「正在播放」訊息下方的 ▶️ 播放、⏸️ 暫停、⏭️ 下一首"
         ),
         inline=False
     )
@@ -317,7 +566,8 @@ async def help_music(ctx):
         value=(
             "✅ YouTube (直接連結或搜尋)\n"
             "✅ Spotify (歌曲、專輯、播放清單)\n"
-            "✅ 關鍵字搜尋"
+            "✅ 關鍵字搜尋\n"
+            "🎤 自動顯示同步歌詞 (資料來源: LRCLIB)"
         ),
         inline=False
     )
