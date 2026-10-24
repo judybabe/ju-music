@@ -8,6 +8,7 @@ from collections import deque
 import re
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
+from lyrics import fetch_synced_lyrics, current_line_index
 
 # 載入環境變數
 load_dotenv()
@@ -21,6 +22,14 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # 音樂佇列 - 每個伺服器都有自己的佇列
 music_queues = {}
+
+# 歌詞同步任務 - 每個伺服器同時只會有一個
+lyrics_tasks = {}
+
+# 歌詞比實際播放提早多少秒顯示，抵銷編輯訊息的網路延遲
+LYRICS_LEAD = 0.3
+# 兩次編輯歌詞訊息之間至少間隔幾秒，避免撞到 Discord 的頻率限制
+LYRICS_MIN_EDIT_INTERVAL = 1.0
 
 # yt-dlp 設定
 ytdl_format_options = {
@@ -42,6 +51,24 @@ ffmpeg_options = {
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+
+class TimedAudio(discord.FFmpegPCMAudio):
+    """記錄已送出的音訊幀數，算出實際播放到第幾秒 (不受 ffmpeg 啟動延遲影響)"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.frames = 0
+
+    def read(self):
+        data = super().read()
+        if data:
+            self.frames += 1
+        return data
+
+    @property
+    def position(self):
+        return self.frames * discord.opus.Encoder.FRAME_LENGTH / 1000
 
 # Spotify API 設定
 spotify_client_id = os.getenv('SPOTIFY_CLIENT_ID')
@@ -165,13 +192,22 @@ async def play_next(ctx):
         
         audio_url = data['url']
         title = data.get('title', '未知標題')
-        
-        # 播放音訊
-        source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
-        ctx.voice_client.play(source, after=lambda e: asyncio.create_task(after_playing(ctx, e)))
-        
+
+        # 播放音訊 (after 是在播放執行緒裡呼叫的，要交回機器人的事件迴圈執行)
+        source = TimedAudio(audio_url, **ffmpeg_options)
+        ctx.voice_client.play(
+            source,
+            after=lambda e: asyncio.run_coroutine_threadsafe(after_playing(ctx, e), bot.loop)
+        )
+
         await ctx.send(f"🎵 正在播放: **{title}**")
-        
+
+        # 用使用者的搜尋字 (或 Spotify 的歌名+歌手) 幫忙找歌詞
+        hint = url[len('ytsearch:'):] if url.startswith('ytsearch:') else None
+        lyrics_tasks[guild_id] = asyncio.create_task(
+            show_lyrics(ctx, source, title, data.get('duration'), hint)
+        )
+
     except Exception as e:
         await ctx.send(f"❌ 播放時發生錯誤: {str(e)}")
         # 如果這首歌出錯，繼續播放下一首
@@ -181,9 +217,61 @@ async def play_next(ctx):
 async def after_playing(ctx, error):
     if error:
         print(f'播放錯誤: {error}')
-    
+
+    stop_lyrics(ctx.guild.id)
+
     # 播放佇列中的下一首歌
     await play_next(ctx)
+
+# 停止目前的歌詞同步
+def stop_lyrics(guild_id):
+    task = lyrics_tasks.pop(guild_id, None)
+    if task:
+        task.cancel()
+
+# 組出歌詞訊息：上一句變淡、正在唱的那句放大、下面預告兩句
+def render_lyrics(title, lines, index):
+    def text(i):
+        return discord.utils.escape_markdown(lines[i][1]) or '♪'
+
+    parts = [f"🎤 **{discord.utils.escape_markdown(title)}**"]
+    if index >= 1:
+        parts.append(f"-# {text(index - 1)}")
+    parts.append(f"# {text(index) if index >= 0 else '♪'}")
+    for i in range(index + 1, min(index + 3, len(lines))):
+        parts.append(text(i))
+    return "\n".join(parts)
+
+# 抓歌詞並跟著播放進度更新訊息
+async def show_lyrics(ctx, source, title, duration, hint):
+    try:
+        lines = await fetch_synced_lyrics(title, duration, hint)
+    except Exception as e:
+        print(f'歌詞抓取錯誤: {e}')
+        lines = None
+
+    if not lines:
+        await ctx.send("-# 🎤 找不到這首歌的同步歌詞")
+        return
+
+    shown = current_line_index(lines, source.position + LYRICS_LEAD)
+    message = await ctx.send(render_lyrics(title, lines, shown))
+
+    while ctx.voice_client and ctx.voice_client.source is source:
+        index = current_line_index(lines, source.position + LYRICS_LEAD)
+        if index == shown:
+            await asyncio.sleep(0.2)
+            continue
+
+        try:
+            await message.edit(content=render_lyrics(title, lines, index))
+        except discord.NotFound:
+            # 歌詞訊息被刪掉了，就不再更新
+            return
+        except discord.HTTPException as e:
+            print(f'更新歌詞失敗: {e}')
+        shown = index
+        await asyncio.sleep(LYRICS_MIN_EDIT_INTERVAL)
 
 # 播放指令
 @bot.command()
@@ -317,7 +405,8 @@ async def help_music(ctx):
         value=(
             "✅ YouTube (直接連結或搜尋)\n"
             "✅ Spotify (歌曲、專輯、播放清單)\n"
-            "✅ 關鍵字搜尋"
+            "✅ 關鍵字搜尋\n"
+            "🎤 自動顯示同步歌詞 (資料來源: LRCLIB)"
         ),
         inline=False
     )
