@@ -26,6 +26,9 @@ music_queues = {}
 # 歌詞同步任務 - 每個伺服器同時只會有一個
 lyrics_tasks = {}
 
+# 「正在播放」訊息上的控制按鈕 - 每個伺服器同時只會有一組
+player_controls = {}
+
 # 歌詞比實際播放提早多少秒顯示，抵銷編輯訊息的網路延遲
 LYRICS_LEAD = 0.3
 # 兩次編輯歌詞訊息之間至少間隔幾秒，避免撞到 Discord 的頻率限制
@@ -71,6 +74,67 @@ class TimedAudio(discord.FFmpegPCMAudio):
     @property
     def position(self):
         return self.frames * discord.opus.Encoder.FRAME_LENGTH / 1000
+
+
+class PlayerControls(discord.ui.View):
+    """「正在播放」訊息下方的播放、暫停、下一首按鈕"""
+
+    def __init__(self, voice_client):
+        # 歌多長按鈕就要能按多久，所以不設逾時
+        super().__init__(timeout=None)
+        self.voice_client = voice_client
+        self.message = None
+        self.sync_buttons()
+
+    def sync_buttons(self):
+        paused = self.voice_client.is_paused()
+        self.resume_button.disabled = not paused
+        self.pause_button.disabled = paused
+
+    async def interaction_check(self, interaction):
+        voice = interaction.user.voice
+        if voice and voice.channel == self.voice_client.channel:
+            return True
+        await interaction.response.send_message("❌ 你要在同一個語音頻道才能控制播放", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="播放", emoji="▶️", style=discord.ButtonStyle.success)
+    async def resume_button(self, interaction, button):
+        if self.voice_client.is_paused():
+            self.voice_client.resume()
+        self.sync_buttons()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="暫停", emoji="⏸️", style=discord.ButtonStyle.secondary)
+    async def pause_button(self, interaction, button):
+        if self.voice_client.is_playing():
+            self.voice_client.pause()
+        self.sync_buttons()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="下一首", emoji="⏭️", style=discord.ButtonStyle.primary)
+    async def skip_button(self, interaction, button):
+        self.disable_all()
+        await interaction.response.edit_message(view=self)
+        # 停掉目前這首會觸發 after_playing，自動接著播佇列的下一首
+        if self.voice_client.is_playing() or self.voice_client.is_paused():
+            self.voice_client.stop()
+
+    def disable_all(self):
+        for item in self.children:
+            item.disabled = True
+        self.stop()
+
+    async def finish(self):
+        """歌曲結束後把按鈕停用，避免按到舊訊息上的按鈕"""
+        if self.is_finished():
+            return
+        self.disable_all()
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 # Spotify API 設定
 spotify_client_id = os.getenv('SPOTIFY_CLIENT_ID')
@@ -202,7 +266,9 @@ async def play_next(ctx):
             after=lambda e: asyncio.run_coroutine_threadsafe(after_playing(ctx, e), bot.loop)
         )
 
-        await ctx.send(f"🎵 正在播放: **{title}**")
+        controls = PlayerControls(ctx.voice_client)
+        controls.message = await ctx.send(f"🎵 正在播放: **{title}**", view=controls)
+        player_controls[guild_id] = controls
 
         # 用使用者的搜尋字 (或 Spotify 的歌名+歌手) 幫忙找歌詞
         lyrics_tasks[guild_id] = asyncio.create_task(
@@ -220,6 +286,9 @@ async def after_playing(ctx, error):
         print(f'播放錯誤: {error}')
 
     stop_lyrics(ctx.guild.id)
+    controls = player_controls.pop(ctx.guild.id, None)
+    if controls:
+        await controls.finish()
 
     # 播放佇列中的下一首歌
     await play_next(ctx)
@@ -371,14 +440,14 @@ async def play(ctx, *, search):
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
             await ctx.send(embed=queued_embed(track, len(music_queues[guild_id])))
 
-    # 如果目前沒有播放音樂，開始播放
-    if not ctx.voice_client.is_playing():
+    # 如果目前沒有播放音樂 (暫停中也算有歌)，開始播放
+    if not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         await play_next(ctx)
 
 # 跳過當前歌曲
 @bot.command()
 async def skip(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
+    if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         ctx.voice_client.stop()
         await ctx.send("⏭️ 已跳過當前歌曲")
     else:
@@ -441,7 +510,8 @@ async def help_music(ctx):
             "`!play <歌名/URL>` - 播放歌曲或加入佇列\n"
             "`!skip` - 跳過當前歌曲\n"
             "`!stop` - 停止播放並清空佇列\n"
-            "`!queue` - 顯示播放佇列"
+            "`!queue` - 顯示播放佇列\n"
+            "也可以按「正在播放」訊息下方的 ▶️ 播放、⏸️ 暫停、⏭️ 下一首"
         ),
         inline=False
     )
