@@ -51,6 +51,8 @@ ffmpeg_options = {
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+# 加入佇列時只需要標題和上傳者，搜尋結果不解析音訊格式會快很多
+ytdl_lookup = yt_dlp.YoutubeDL({**ytdl_format_options, 'extract_flat': 'in_playlist'})
 
 
 class TimedAudio(discord.FFmpegPCMAudio):
@@ -179,12 +181,12 @@ async def play_next(ctx):
     if guild_id not in music_queues or not music_queues[guild_id]:
         return
     
-    url = music_queues[guild_id].popleft()
-    
+    track = music_queues[guild_id].popleft()
+
     try:
         # 從YouTube取得音訊串流
         data = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: ytdl.extract_info(url, download=False)
+            None, lambda: ytdl.extract_info(track['url'], download=False)
         )
         
         if 'entries' in data:
@@ -203,9 +205,8 @@ async def play_next(ctx):
         await ctx.send(f"🎵 正在播放: **{title}**")
 
         # 用使用者的搜尋字 (或 Spotify 的歌名+歌手) 幫忙找歌詞
-        hint = url[len('ytsearch:'):] if url.startswith('ytsearch:') else None
         lyrics_tasks[guild_id] = asyncio.create_task(
-            show_lyrics(ctx, source, title, data.get('duration'), hint)
+            show_lyrics(ctx, source, title, data.get('duration'), track['hint'])
         )
 
     except Exception as e:
@@ -273,6 +274,33 @@ async def show_lyrics(ctx, source, title, duration, hint):
         shown = index
         await asyncio.sleep(LYRICS_MIN_EDIT_INTERVAL)
 
+# 先查出影片的標題和上傳者，加入佇列時才能顯示
+async def resolve_track(query, hint=None):
+    data = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: ytdl_lookup.extract_info(query, download=False)
+    )
+    if 'entries' in data:
+        if not data['entries']:
+            return None
+        data = data['entries'][0]
+
+    return {
+        'url': data.get('webpage_url') or data.get('url') or query,
+        'title': ' '.join((data.get('title') or '未知標題').split()),
+        'uploader': data.get('uploader') or data.get('channel') or '未知',
+        'hint': hint,
+    }
+
+# 「已加入佇列」的卡片
+def queued_embed(track, position):
+    embed = discord.Embed(
+        title="➕ 已加入佇列",
+        description=f"**{discord.utils.escape_markdown(track['title'])}**"
+    )
+    embed.add_field(name="👤 Uploader", value=discord.utils.escape_markdown(track['uploader']), inline=True)
+    embed.add_field(name="#️⃣ 位置", value=str(position), inline=True)
+    return embed
+
 # 播放指令
 @bot.command()
 async def play(ctx, *, search):
@@ -287,47 +315,62 @@ async def play(ctx, *, search):
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
         music_queues[guild_id] = deque()
-    
+
+    # 要加入佇列的單首歌：(搜尋字串或網址, 找歌詞用的提示)
+    single = None
+
     # 檢查是否為 Spotify URL
     if 'spotify.com' in search:
         await ctx.send("🎵 正在處理 Spotify 連結...")
         spotify_info = await get_spotify_track_info(search)
-        
+
         if not spotify_info:
             await ctx.send("❌ 無法處理此 Spotify 連結，請檢查 Spotify API 設定")
             return
-        
+
         # 處理單首歌曲
         if isinstance(spotify_info, tuple) and len(spotify_info) == 3:
             search_query, title, artist = spotify_info
-            youtube_search = f"ytsearch:{search_query}"
-            music_queues[guild_id].append(youtube_search)
-            await ctx.send(f"✅ 已從 Spotify 加入: **{title}** - {artist}")
-            
-        # 處理播放清單或專輯
+            single = (f"ytsearch:{search_query}", search_query)
+
+        # 處理播放清單或專輯 (歌太多，不一首首查標題，播放時才搜尋)
         elif isinstance(spotify_info, list):
             added_count = 0
             for search_query, title, artist in spotify_info[:50]:  # 限制最多50首
-                youtube_search = f"ytsearch:{search_query}"
-                music_queues[guild_id].append(youtube_search)
+                music_queues[guild_id].append({
+                    'url': f"ytsearch:{search_query}",
+                    'title': f"{title} - {artist}",
+                    'uploader': artist,
+                    'hint': search_query,
+                })
                 added_count += 1
-            
+
             await ctx.send(f"✅ 已從 Spotify 加入 {added_count} 首歌曲到佇列")
-    
+
     # 處理YouTube URL或一般搜尋
     else:
         # 如果不是URL，當作搜尋關鍵字
-        if not (search.startswith('http://') or search.startswith('https://')):
-            search = f"ytsearch:{search}"
-        
-        music_queues[guild_id].append(search)
-        
-        # 嘗試取得歌曲標題預覽
-        if search.startswith('ytsearch:'):
-            await ctx.send(f"✅ 已加入佇列: {search[9:]}")  # 移除 'ytsearch:' 前綴
+        if search.startswith('http://') or search.startswith('https://'):
+            single = (search, None)
         else:
-            await ctx.send(f"✅ 已加入佇列")
-    
+            single = (f"ytsearch:{search}", search)
+
+    if single:
+        try:
+            track = await resolve_track(*single)
+        except Exception as e:
+            await ctx.send(f"❌ 找不到這首歌: {str(e)}")
+            return
+        if not track:
+            await ctx.send("❌ 找不到這首歌")
+            return
+
+        music_queues[guild_id].append(track)
+
+        # 前面還有歌在播，才需要告訴使用者排在第幾首
+        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            await ctx.send(embed=queued_embed(track, len(music_queues[guild_id])))
+
     # 如果目前沒有播放音樂，開始播放
     if not ctx.voice_client.is_playing():
         await play_next(ctx)
@@ -362,7 +405,10 @@ async def queue(ctx):
         return
     
     queue_list = list(music_queues[guild_id])
-    queue_text = "\n".join([f"{i+1}. {song}" for i, song in enumerate(queue_list[:10])])
+    queue_text = "\n".join([
+        f"{i+1}. {discord.utils.escape_markdown(track['title'])}"
+        for i, track in enumerate(queue_list[:10])
+    ])
     
     embed = discord.Embed(title="🎵 播放佇列", description=queue_text, color=0x00ff00)
     if len(queue_list) > 10:

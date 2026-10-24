@@ -20,7 +20,7 @@ _OFFSET = re.compile(r'^\[offset:\s*([+-]?\d+)\]', re.IGNORECASE)
 _NOISE = re.compile(
     r'official\s*(music\s*)?(video|mv|audio|visualizer)|music\s*video|lyrics?\s*video|'
     r'\blyrics?\b|\bm/?v\b|\bhd\b|\b4k\b|'
-    r'官方(完整)?(版)?|動態歌詞|歌詞版?|完整版|高音質',
+    r'官方(完整)?(版)?|公式|動態歌詞|歌詞動[画畫]|歌詞版?|完整版|高音質',
     re.IGNORECASE,
 )
 _BRACKETS = re.compile(r'[【「『《〈\[](.+?)[】」』》〉\]]')
@@ -77,6 +77,9 @@ def _script_runs(text):
 
 def build_queries(title, hint=None):
     """從 YouTube 標題 (和使用者的搜尋字) 組出由精確到寬鬆的 LRCLIB 搜尋字串"""
+    # 括號裡只有雜訊 (例：【歌詞動画/Lyric Video】) 就整個拿掉，不當成歌名
+    title = _BRACKETS.sub(lambda m: m.group(0) if _clean(m.group(1)) else ' ', title)
+
     bracket = _BRACKETS.search(title)
     if bracket:
         # 例：周杰倫 Jay Chou【青花瓷 Blue and White Porcelain】-Official Music Video
@@ -119,15 +122,15 @@ def _pick_synced(results, duration):
     return min(candidates, key=lambda item: abs(item['duration'] - duration), default=None)
 
 
-async def _search(session, query):
-    for attempt in range(2):
+async def _search(session, query, retries=2):
+    for attempt in range(retries + 1):
         async with session.get(LRCLIB_SEARCH_URL, params={'q': query}) as response:
             if response.status == 200:
                 results = await response.json()
                 return results if isinstance(results, list) else []
-            # LRCLIB 忙碌時會回 503，稍等一下再試一次
-            if response.status in (429, 503) and attempt == 0:
-                await asyncio.sleep(1)
+            # LRCLIB 忙碌時常回 503，等一下再試 (1 秒、2 秒)
+            if response.status in (429, 503) and attempt < retries:
+                await asyncio.sleep(attempt + 1)
                 continue
             return []
     return []
